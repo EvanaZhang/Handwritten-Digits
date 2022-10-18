@@ -30,7 +30,9 @@ This dataset has total 786 pixels in each digit. The first step is check dataset
 Conclusion
       
 • Tree depth determines the depth of the trees; the min_n indicates the minimum number of variables and the learning rate manifests the coefficient when tuning.
+
 • Epoch indicates the number of times the dataset passes the model; penalty decides the model’s loss function; hidden units control the number of functions for the model’s input.
+
 • By comparing the ROC_AUC and the accuracy from the Multilayer Perception, XGBoost and Random Forest models. Random forest model will be the best model to fit the data. That’s why using the random forest model to do the kaggle prediction with the highest values on both accuracy and roc_auc. (See Detailed Analysis and Steps Table 4)
 
 
