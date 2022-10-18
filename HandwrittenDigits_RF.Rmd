@@ -1,0 +1,343 @@
+---
+title: "Project5_RF"
+author: "Yifei Zhang"
+date: "11/22/2021"
+output: html_document
+---
+# Libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(textrecipes)
+library(stringr)
+library(tidytext)
+options(yardstick.event_first = FALSE)
+```
+
+## Read Data
+
+```{r}
+digit <- read_csv("digit_train.csv") %>%
+  janitor::clean_names()%>%
+  mutate(label = as.factor(label))
+
+Kaggle <- read_csv("digit_holdout.csv")%>%
+  janitor::clean_names()
+
+head(digit)
+```
+
+## Train Test Split 
+
+```{r}
+train_test_spit<- initial_split(digit, prop = 0.7)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+train_scaled <- train %>%
+  mutate_if(is.numeric, funs(./255)) 
+
+test_scaled <- test %>%
+  mutate_if(is.numeric, funs(./255)) 
+
+sprintf("Train PCT : %d", nrow(train))
+sprintf("Test  PCT : %d", nrow(test))
+
+train_cv_folds <- vfold_cv(train, v=3)
+train_cv_folds
+
+```
+
+
+```{r}
+digit_recipe <- recipe(label ~ ., train_scaled)%>%
+  step_rm(id)
+```
+
+
+```{r}
+rf_model <- rand_forest(
+    trees  = tune(),
+    min_n = 9,
+    mtry = 7
+   ) %>% 
+      set_engine("ranger", importance = "impurity") %>% 
+      set_mode("classification")
+
+rf_workflow <- workflow() %>%
+  add_recipe(digit_recipe) %>%
+  add_model(rf_model) 
+
+
+tune_grid <- grid_regular(trees(c(390,400)),
+                          levels = 5)
+
+
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results
+```
+
+```{r}
+rf_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>%
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err)) 
+```
+
+```{r}
+## - visualize 
+rf_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>%
+  ggplot(aes(trees, mean, )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+# rf_tuning_results %>%
+#   collect_metrics()  %>%
+#   mutate_if(is.numeric, round,3) %>%
+#   ggplot(aes(min_n, mean, )) +
+#   geom_line(size = 1.5, alpha = 0.6) +
+#   geom_point(size = 2) +
+#   facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+```
+
+
+### Pick
+
+```{r}
+rf_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+rf_best <- rf_tuning_results %>%
+  select_best("roc_auc") 
+
+print(rf_best)
+```
+
+```{r}
+rf_final_wf <- rf_workflow %>% 
+  finalize_workflow(rf_best)
+
+print(rf_final_wf)
+
+rf_final_fit  <- rf_final_wf %>%
+  fit(data = train_scaled) 
+
+```
+
+
+```{r}
+predict(rf_final_fit, train_scaled,type="class") %>%
+    bind_cols(., train )-> scored_train
+    
+predict(rf_final_fit, test_scaled,type="class") %>%
+    bind_cols(., test )-> scored_test
+
+scored_test$label <- factor(scored_test$label,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+scored_test$.pred_class <- factor(scored_test$.pred_class,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+scored_train %>%
+  mutate(.part = "train") %>%
+  bind_rows(scored_test %>%
+              mutate(.part = "test")
+  ) %>%
+  group_by(.part) %>%
+    metrics(label, estimate = .pred_class) %>%
+  filter(.metric == "accuracy") %>%
+  spread(.metric, .estimate) %>%
+  select(-.estimator)
+
+ scored_test %>%
+    conf_mat(label, .pred_class) %>%
+    autoplot(type = "heatmap")
+```
+
+
+```{r}
+theme_set(theme_light())
+theme_set(theme_light())
+
+
+pixels_gathered <- scored_test %>%
+  filter(label == 1) %>%
+  filter(label != .pred_class) %>%
+  select(starts_with("x"), label,.pred_class ) %>%
+  head(12) %>%
+  mutate(instance = row_number()) %>%
+  gather(x, value, -label, -instance, -.pred_class) %>%
+  tidyr::extract(x, "pixel", "(\\d+)", convert = TRUE) %>%
+  mutate(pixel = pixel - 2,
+         x = pixel %% 28,
+         y = 28 - pixel %/% 28)
+
+
+pixels_gathered$label <- factor(pixels_gathered$label,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered$.pred_class <- factor(pixels_gathered$.pred_class,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+
+pixels_gathered %>%
+  ggplot(aes(x, y, fill = value)) +
+  geom_tile() +
+  facet_wrap(~label + .pred_class)
+
+```
+## Even more wrong predictions 
+
+
+```{r}
+pixels_gathered <- scored_test %>%
+  filter(label == 0) %>%
+  filter(label != .pred_class) %>%
+  select(starts_with("x"), label,.pred_class ) %>%
+  head(12) %>%
+  mutate(instance = row_number()) %>%
+  gather(x, value, -label, -instance, -.pred_class) %>%
+  tidyr::extract(x, "pixel", "(\\d+)", convert = TRUE) %>%
+  mutate(pixel = pixel - 2,
+         x = pixel %% 28,
+         y = 28 - pixel %/% 28)
+
+pixels_gathered$label <- factor(pixels_gathered$label,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered$.pred_class <- factor(pixels_gathered$.pred_class,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered %>%
+  ggplot(aes(x, y, fill = value)) +
+  geom_raster() +
+   scale_fill_gradient(low = "white", high = "black", na.value = NA) + 
+  facet_wrap(~ label + .pred_class) 
+
+
+```
+
+```{r}
+pixels_gathered <- scored_test %>%
+  filter(label == 0) %>% # cycle through examples 
+  filter(label != .pred_class) %>%
+  select(starts_with("x"), label,.pred_class ) %>%
+  head(12) %>%
+  mutate(instance = row_number()) %>%
+  gather(x, value, -label, -instance, -.pred_class) %>%
+  tidyr::extract(x, "pixel", "(\\d+)", convert = TRUE) %>%
+  mutate(pixel = pixel - 2,
+         x = pixel %% 28,
+         y = 28 - pixel %/% 28)
+
+pixels_gathered$label <- factor(pixels_gathered$label,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered$.pred_class <- factor(pixels_gathered$.pred_class,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered %>%
+  ggplot(aes(x, y, fill = value)) +
+  geom_raster() +
+   scale_fill_gradient(low = "white", high = "black", na.value = NA) + 
+  facet_wrap(~ label + .pred_class) 
+
+```
+
+
+```{r}
+number_check <- function(label_id){
+  predict(rf_final_fit, test_scaled,type="class") %>%
+    bind_cols(., test )-> scored_test
+
+pixels_gathered <- scored_test %>%
+  filter(label == label_id) %>% # cycle through examples 
+  filter(label != .pred_class) %>%
+  select(starts_with("x"), label,.pred_class ) %>%
+  head(12) %>%
+  mutate(instance = row_number()) %>%
+  gather(x, value, -label, -instance, -.pred_class) %>%
+  tidyr::extract(x, "pixel", "(\\d+)", convert = TRUE) %>%
+  mutate(pixel = pixel - 2,
+         x = pixel %% 28,
+         y = 28 - pixel %/% 28)
+
+pixels_gathered$label <- factor(pixels_gathered$label,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered$.pred_class <- factor(pixels_gathered$.pred_class,
+levels = c(0,1,2,3,4,5,6,7,8,9),
+labels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"))
+
+pixels_gathered %>%
+  ggplot(aes(x, y, fill = value)) +
+  geom_raster() +
+   scale_fill_gradient(low = "white", high = "black", na.value = NA) + 
+  facet_wrap(~ label + .pred_class)
+  
+}
+
+
+
+for (i in 0:9){
+  p <- number_check(i)
+  print(p)
+}
+
+```
+
+```{r}
+# -- Metrics: Train and Test 
+scored_train %>% 
+  metrics(label, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test %>% 
+               metrics(label, .pred_class) %>%
+               mutate(part="testing") ) %>%
+  pivot_wider(names_from = .metric, values_from=.estimate)
+```
+
+```{r}
+
+
+new_benchmark <- predict(rf_final_fit, Kaggle, type = "class") %>%
+  bind_cols(Kaggle) %>%
+  dplyr::select(id =id, label= .pred_class)
+
+ head(new_benchmark)
+#
+  write_csv(new_benchmark,"kaggle_prediction_rf.csv")
+```
